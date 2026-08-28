@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warpspeed 3D Tunnel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;500;800&display=swap" rel="stylesheet">
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Inter', sans-serif;
+        }
+        
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .vignette {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at center, transparent 30%, rgba(0,0,0,0.9) 100%);
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        #progress-container {
+            width: 100%;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            position: relative;
+        }
+
+        #progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00d4ff, #ff2a40);
+            transition: width 0.1s ease-out;
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.8);
+        }
+
+        .scroll-indicator {
+            animation: bounce 2s infinite;
+        }
+
+        @keyframes bounce {
+            0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+            40% { transform: translateY(-10px); }
+            60% { transform: translateY(-5px); }
+        }
+
+        .hud-text {
+            text-shadow: 0 2px 10px rgba(0,0,0,0.8);
+        }
+
+        #speed-warning {
+            opacity: 0;
+            transition: opacity 0.2s;
+            color: #ff2a40;
+            text-shadow: 0 0 20px #ff2a40;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+</head>
+<body class="text-white">
+
+    <div id="canvas-container"></div>
+    <div class="vignette"></div>
+
+    <div id="ui-layer" class="p-8">
+        <div class="flex justify-between items-start w-full">
+            <div class="flex flex-col">
+                <div class="text-xs tracking-[0.3em] font-light hud-text opacity-70">SYSTEM.ONLINE</div>
+                <div id="speed-warning" class="text-xs tracking-[0.4em] font-bold mt-2">WARPSPEED ENGAGED</div>
+            </div>
+            <div class="flex flex-col items-end">
+                <div id="milestone-text" class="text-sm tracking-[0.2em] font-medium hud-text">DEPTH: 0M</div>
+                <div id="velocity-text" class="text-xs tracking-[0.2em] font-light hud-text opacity-70 mt-2">VEL: 0.0 KPH</div>
+            </div>
+        </div>
+
+        <div id="intro-text" class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-center transition-opacity duration-1000">
+            <h1 class="text-5xl md:text-7xl font-extrabold tracking-tighter mb-4 italic">THE VOID</h1>
+            <p class="text-sm md:text-lg font-light tracking-widest scroll-indicator opacity-80 text-cyan-400">FLICK SCROLL TO ACCELERATE</p>
+        </div>
+
+        <div class="w-full pb-4">
+            <div class="flex justify-between text-[10px] tracking-widest mb-2 opacity-50">
+                <span>SECTOR ALPHA</span>
+                <span>SECTOR OMEGA</span>
+            </div>
+            <div id="progress-container" class="rounded-full overflow-hidden">
+                <div id="progress-bar"></div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Momentum Physics State ---
+        let targetTravel = 0;
+        let currentTravel = 0;
+        let previousTravel = 0;
+        let scrollVelocity = 0;
+        let smoothedSpeed = 0;
+        
+        let lastSpawnTravel = 0;
+        let spawnInterval = 50;
+        let isDragging = false;
+        let dragY = 0;
+        
+        const activeObjects = [];
+        
+        // Colors
+        const colorCool = new THREE.Color(0x00d4ff); // Cyan/Blue
+        const colorWarm = new THREE.Color(0xff2a40); // Crimson/Red
+        const currentGlobalCurve = new THREE.Vector2(0, 0);
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.0035);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1500);
+        camera.position.set(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // --- Reusable Shader Chunk for World Curvature ---
+        // This bends the entire world mathematically based on Z-depth
+        const curvatureVertexChunk = `
+            uniform vec2 uCurve;
+            varying float vDepth;
+            vec3 applyCurvature(vec3 pos) {
+                float depth = max(0.0, -pos.z);
+                vDepth = depth;
+                pos.x += uCurve.x * depth * depth;
+                pos.y += uCurve.y * depth * depth;
+                return pos;
+            }
+        `;
+
+        // 1. The Curving Tunnel
+        const tunnelGeometry = new THREE.CylinderGeometry(15, 15, 1000, 32, 64, true);
+        tunnelGeometry.rotateX(Math.PI / 2);
+        tunnelGeometry.translate(0, 0, -400);
+
+        const tunnelMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                uTime: { value: 0 },
+                uTravel: { value: 0 },
+                uSpeed: { value: 0 },
+                uColor: { value: colorCool },
+                uCurve: { value: currentGlobalCurve }
+            },
+            vertexShader: `
+                ${curvatureVertexChunk}
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                    worldPos.xyz = applyCurvature(worldPos.xyz);
+                    gl_Position = projectionMatrix * viewMatrix * worldPos;
+                }
+            `,
+            fragmentShader: `
+                uniform float uTime;
+                uniform float uTravel;
+                uniform float uSpeed;
+                uniform vec3 uColor;
+                varying vec2 vUv;
+
+                float hash(vec2 p) { return fract(1e4 * sin(17.0 * p.x + p.y * 0.1) * (0.1 + abs(sin(p.y * 13.0 + p.x)))); }
+
+                void main() {
+                    float absoluteZ = (1.0 - vUv.y) * 1000.0 + uTravel; 
+                    
+                    // Void Break Logic
+                    float cycle = mod(absoluteZ, 4000.0);
+                    float gapAlpha = 1.0;
+                    float blend = 300.0; 
+                    
+                    if(cycle > 2500.0 && cycle < 3500.0) {
+                        gapAlpha = 1.0 - smoothstep(2500.0, 2500.0 + blend, cycle);
+                        if(cycle > 3500.0 - blend) {
+                            gapAlpha = smoothstep(3500.0 - blend, 3500.0, cycle);
+                        } else if(cycle > 2500.0 + blend) {
+                            gapAlpha = 0.0;
+                        }
+                    }
+
+                    // Warpspeed Motion Blur on Grid
+                    float blurPower = min(uSpeed * 0.02, 0.8);
+                    float lineX = smoothstep(0.95 - blurPower, 1.0, abs(fract(vUv.x * 30.0) - 0.5) * 2.0);
+                    float lineY = smoothstep(0.9 - blurPower, 1.0, abs(fract(absoluteZ * 0.02) - 0.5) * 2.0);
+                    float grid = max(lineX, lineY);
+
+                    float scanline = sin(absoluteZ * 0.1 - uTime * 10.0) * 0.5 + 0.5;
+                    float n = hash(floor(vec2(vUv.x * 60.0, absoluteZ * 0.5)));
+                    
+                    vec3 finalColor = mix(uColor * 0.1, uColor, grid + (n * scanline * 0.5));
+                    
+                    // Streaking effect when moving fast
+                    float streak = hash(vec2(vUv.x * 150.0, floor(absoluteZ * 0.005 - uTime * 20.0)));
+                    finalColor += uColor * streak * min(uSpeed * 0.15, 1.5);
+
+                    float baseOpacity = max(grid, 0.15) + (n * 0.1);
+                    gl_FragColor = vec4(finalColor, baseOpacity * gapAlpha);
+                }
+            `,
+            side: THREE.BackSide,
+            transparent: true,
+            blending: THREE.AdditiveBlending
+        });
+
+        const tunnel = new THREE.Mesh(tunnelGeometry, tunnelMaterial);
+        tunnel.frustumCulled = false; // Prevent culling due to mathematical curvature
+        scene.add(tunnel);
+
+        // 2. Open Sky Background
+        const skyGeometry = new THREE.SphereGeometry(300, 32, 32);
+        const skyMaterial = new THREE.ShaderMaterial({
+            uniforms: { uTime: { value: 0 }, uColor: { value: colorCool } },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform float uTime;
+                uniform vec3 uColor;
+                varying vec2 vUv;
+                void main() {
+                    vec2 p = vUv * 80.0;
+                    float noise = fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+                    float star = smoothstep(0.98, 1.0, noise) * (sin(uTime * 3.0 + noise * 100.0) * 0.5 + 0.5);
+                    float glow = sin(vUv.y * 10.0 + uTime) * 0.5 + 0.5;
+                    vec3 color = uColor * star * 8.0 + (uColor * 0.05 * glow);
+                    gl_FragColor = vec4(color, 1.0);
+                }
+            `,
+            side: THREE.BackSide
+        });
+        const sky = new THREE.Mesh(skyGeometry, skyMaterial);
+        scene.add(sky);
+
+        // 3. Warpspeed Instanced Particles
+        const particleCount = 1500;
+        const particleGeo = new THREE.BoxGeometry(0.08, 0.08, 1.0);
+        const particleMat = new THREE.ShaderMaterial({
+            uniforms: {
+                uCurve: { value: currentGlobalCurve },
+                uSpeed: { value: 0 },
+                uColor: { value: new THREE.Color(0xffffff) }
+            },
+            vertexShader: `
+                ${curvatureVertexChunk}
+                uniform float uSpeed;
+                void main() {
+                    vec3 scaledPos = position;
+                    // Stretch particles deeply along Z when traveling fast
+                    scaledPos.z *= (1.0 + uSpeed * 3.0); 
+                    
+                    vec4 worldPos = modelMatrix * instanceMatrix * vec4(scaledPos, 1.0);
+                    worldPos.xyz = applyCurvature(worldPos.xyz);
+                    gl_Position = projectionMatrix * viewMatrix * worldPos;
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 uColor;
+                varying float vDepth;
+                void main() {
+                    float fade = smoothstep(1000.0, 600.0, vDepth); // Fade in from distance
+                    gl_FragColor = vec4(uColor, 0.7 * fade);
+                }
+            `,
+            transparent: true,
+            blending: THREE.AdditiveBlending
+        });
+
+        const particles = new THREE.InstancedMesh(particleGeo, particleMat, particleCount);
+        particles.frustumCulled = false;
+        
+        const dummy = new THREE.Object3D();
+        for(let i=0; i<particleCount; i++) {
+            dummy.position.set((Math.random() - 0.5) * 50, (Math.random() - 0.5) * 50, Math.random() * -1000);
+            dummy.updateMatrix();
+            particles.setMatrixAt(i, dummy.matrix);
+        }
+        scene.add(particles);
+
+        // --- Content Generation (Dynamic Canvases) ---
+        const texts = ["Awwwards Tier", "Scroll Faster", "Dive Deeper", "The Void", "Unlimited", "WebGL Immersion", "Velocity", "Beyond Reality"];
+        const ctas = ["DISCOVER", "EXPLORE", "ENTER", "UNLOCK", "INITIATE"];
+
+        function createContentCanvas(type) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+
+            if (type === 'pattern') {
+                ctx.fillStyle = `hsla(${Math.random()*360}, 40%, 8%, 0.8)`;
+                ctx.fillRect(0, 0, 1024, 512);
+                for(let i=0; i<12; i++) {
+                    ctx.beginPath();
+                    ctx.strokeStyle = `hsla(${Math.random()*360}, 80%, 60%, 0.5)`;
+                    ctx.lineWidth = 2 + Math.random() * 10;
+                    ctx.arc(Math.random()*1024, Math.random()*512, Math.random()*250, 0, Math.PI*2);
+                    ctx.stroke();
+                }
+                ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+                ctx.lineWidth = 15;
+                ctx.strokeRect(15, 15, 994, 482);
+            } else if (type === 'cta') {
+                const text = ctas[Math.floor(Math.random() * ctas.length)];
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+                ctx.beginPath();
+                ctx.roundRect(100, 120, 824, 272, 40);
+                ctx.fill();
+                ctx.fillStyle = '#000000';
+                ctx.font = '900 130px "Inter", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(text, 512, 266);
+            } else {
+                const text = texts[Math.floor(Math.random() * texts.length)];
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.4)'; 
+                ctx.fillRect(0,0,1024,512);
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '800 100px "Inter", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.shadowColor = "rgba(0,0,0,0.8)";
+                ctx.shadowBlur = 20;
+                ctx.fillText(text, 512, 256);
+                
+                ctx.shadowBlur = 0;
+                ctx.fillStyle = 'rgba(255,255,255,0.5)';
+                ctx.fillRect(50, 50, 50, 10); ctx.fillRect(50, 50, 10, 50);
+                ctx.fillRect(924, 452, 50, 10); ctx.fillRect(964, 412, 10, 50);
+            }
+            return canvas;
+        }
+
+        function spawnContent() {
+            const typeRoll = Math.random();
+            let type = 'pattern';
+            if(typeRoll > 0.75) type = 'cta';
+            else if(typeRoll > 0.4) type = 'text';
+
+            let radius, parallax, width, height;
+
+            if (type === 'pattern') {
+                radius = 18 + Math.random() * 8; 
+                parallax = 0.5 + Math.random() * 0.3; 
+                width = 40 + Math.random() * 20;
+                height = 20 + Math.random() * 10;
+            } else if (type === 'cta') {
+                radius = 11 + Math.random() * 2; 
+                parallax = 1.3 + Math.random() * 0.3; 
+                width = 16;
+                height = 8;
+            } else {
+                radius = 14 + Math.random() * 1.5; 
+                parallax = 1.0 + Math.random() * 0.1;
+                width = 24;
+                height = 12;
+            }
+
+            const canvas = createContentCanvas(type);
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            
+            // Custom material to allow content panels to curve with the tunnel
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uMap: { value: texture },
+                    uCurve: { value: currentGlobalCurve }
+                },
+                vertexShader: `
+                    ${curvatureVertexChunk}
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                        worldPos.xyz = applyCurvature(worldPos.xyz);
+                        gl_Position = projectionMatrix * viewMatrix * worldPos;
+                    }
+                `,
+                fragmentShader: `
+                    uniform sampler2D uMap;
+                    varying vec2 vUv;
+                    varying float vDepth;
+                    void main() {
+                        vec4 tex = texture2D(uMap, vUv);
+                        // Fade in smoothly from the void
+                        float fade = smoothstep(800.0, 500.0, vDepth);
+                        gl_FragColor = vec4(tex.rgb, tex.a * fade);
+                    }
+                `,
+                transparent: true,
+                side: THREE.DoubleSide,
+                blending: type === 'cta' ? THREE.NormalBlending : THREE.AdditiveBlending
+            });
+
+            const geometry = new THREE.PlaneGeometry(width, height);
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.frustumCulled = false;
+
+            const baseAngle = Math.floor(Math.random() * 4) * (Math.PI / 2);
+            const offsetAngle = baseAngle + (Math.random() - 0.5) * 0.6;
+            
+            const x = Math.cos(offsetAngle) * radius;
+            const y = Math.sin(offsetAngle) * radius;
+            const z = -900; 
+
+            mesh.position.set(x, y, z);
+            mesh.lookAt(0, 0, z);
+
+            if (Math.abs(x) > Math.abs(y)) {
+                 mesh.rotation.y += x > 0 ? -0.15 : 0.15;
+            } else {
+                 mesh.rotation.x += y > 0 ? 0.15 : -0.15;
+            }
+
+            mesh.userData = { parallax, type, randomOffset: Math.random() * 100 };
+            scene.add(mesh);
+            activeObjects.push(mesh);
+        }
+
+        // --- Momentum Input Handling ---
+        const introText = document.getElementById('intro-text');
+        
+        window.addEventListener('wheel', (e) => {
+            // Flicking wheel builds velocity rapidly
+            scrollVelocity += Math.max(e.deltaY, 0) * 0.015; 
+            if(scrollVelocity > 0.5) introText.style.opacity = '0';
+        }, { passive: true });
+
+        window.addEventListener('touchstart', (e) => {
+            isDragging = true;
+            dragY = e.touches[0].clientY;
+        }, { passive: true });
+
+        window.addEventListener('touchmove', (e) => {
+            if(!isDragging) return;
+            const y = e.touches[0].clientY;
+            const delta = dragY - y;
+            dragY = y;
+            scrollVelocity += Math.max(delta, 0) * 0.05;
+            if(scrollVelocity > 0.5) introText.style.opacity = '0';
+        }, { passive: true });
+
+        window.addEventListener('touchend', () => { isDragging = false; });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Animation Loop ---
+        const clock = new THREE.Clock();
+        const progressBar = document.getElementById('progress-bar');
+        const milestoneText = document.getElementById('milestone-text');
+        const velocityText = document.getElementById('velocity-text');
+        const speedWarning = document.getElementById('speed-warning');
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // 1. Momentum Physics Update
+            if (scrollVelocity < 0) scrollVelocity = 0;
+            targetTravel += scrollVelocity;
+            scrollVelocity *= 0.96; // Glide friction
+
+            currentTravel += (targetTravel - currentTravel) * 0.08;
+            const speed = currentTravel - previousTravel;
+            previousTravel = currentTravel;
+            
+            // Smooth speed for visual effects to prevent jitter
+            smoothedSpeed += (speed - smoothedSpeed) * 0.1;
+
+            // 2. Procedural Curvature Calculation (Dip, Dive, Turn, Climb)
+            // Complex intersecting sines create unpredictable, snake-like paths
+            const curveX = (Math.sin(currentTravel * 0.0008) + Math.sin(currentTravel * 0.0003)) * 0.0004;
+            const curveY = (Math.cos(currentTravel * 0.0006) + Math.cos(currentTravel * 0.0004)) * 0.0004;
+            currentGlobalCurve.set(curveX, curveY);
+
+            // 3. Dynamic Camera Banking & Pitch (Reacts to the curves and speed)
+            // Look slightly into the turn, bank/roll heavily based on curveX, pitch based on curveY
+            const targetYaw = curveX * -600.0;
+            const targetPitch = curveY * 400.0;
+            const targetRoll = curveX * -1200.0 * Math.min(smoothedSpeed * 0.2 + 0.5, 1.5); // Bank harder when fast
+
+            camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, targetYaw, 0.05);
+            camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, targetPitch, 0.05);
+            camera.rotation.z = THREE.MathUtils.lerp(camera.rotation.z, targetRoll, 0.05);
+
+            // Additional camera shake at high speeds
+            camera.position.x = Math.sin(time * 30.0) * smoothedSpeed * 0.02;
+            camera.position.y = Math.cos(time * 25.0) * smoothedSpeed * 0.02;
+
+            // Extreme FOV warp for Warpspeed
+            const warpFactor = Math.min(Math.max(smoothedSpeed * 0.8, 0), 60);
+            camera.fov = THREE.MathUtils.lerp(camera.fov, 75 + warpFactor, 0.08);
+            camera.updateProjectionMatrix();
+
+            // 4. Global Color Transitions
+            const colorPhase = (Math.sin(currentTravel * 0.0005) + 1.0) * 0.5;
+            const currentColor = new THREE.Color().lerpColors(colorCool, colorWarm, colorPhase);
+
+            // 5. Update Global Shaders
+            tunnelMaterial.uniforms.uTravel.value = currentTravel;
+            tunnelMaterial.uniforms.uSpeed.value = smoothedSpeed;
+            tunnelMaterial.uniforms.uColor.value = currentColor;
+            tunnelMaterial.uniforms.uTime.value = time;
+            
+            particleMat.uniforms.uSpeed.value = smoothedSpeed;
+            particleMat.uniforms.uColor.value = currentColor;
+
+            skyMaterial.uniforms.uColor.value = currentColor;
+            skyMaterial.uniforms.uTime.value = time;
+
+            // 6. The "Void" Break Logic
+            const cycle = currentTravel % 4000;
+            let gapFactor = 0;
+            if(cycle > 2500 && cycle < 3500) {
+                gapFactor = Math.sin(((cycle - 2500) / 1000) * Math.PI); 
+            }
+            scene.fog.density = THREE.MathUtils.lerp(0.0035, 0.0001, gapFactor);
+            scene.fog.color = currentColor.clone().multiplyScalar(0.1);
+
+            // 7. Content Lifecycle
+            if (currentTravel - lastSpawnTravel > spawnInterval) {
+                spawnContent();
+                lastSpawnTravel = currentTravel;
+                spawnInterval = 30 + Math.random() * 80; // Adaptive spacing
+            }
+
+            for (let i = activeObjects.length - 1; i >= 0; i--) {
+                const obj = activeObjects[i];
+                obj.position.z += speed * obj.userData.parallax;
+                obj.position.y += Math.sin(time * 2.0 + obj.userData.randomOffset) * 0.01;
+                obj.position.x += Math.cos(time * 1.5 + obj.userData.randomOffset) * 0.01;
+
+                if (obj.position.z > 50) {
+                    scene.remove(obj);
+                    obj.geometry.dispose();
+                    obj.material.uniforms.uMap.value.dispose();
+                    obj.material.dispose();
+                    activeObjects.splice(i, 1);
+                }
+            }
+
+            // 8. Particle Infinite Loop
+            // The instanced mesh leaps forward, effectively looping the particles around the camera
+            particles.position.z = (currentTravel * 1.5) % 1000;
+
+            // 9. UI Updates
+            const progressPercent = (currentTravel % 4000) / 4000 * 100;
+            progressBar.style.width = `${progressPercent}%`;
+            progressBar.style.background = `#${currentColor.getHexString()}`;
+
+            velocityText.innerText = `VEL: ${(smoothedSpeed * 10).toFixed(1)} KPH`;
+
+            if (smoothedSpeed > 15) {
+                speedWarning.style.opacity = '1';
+                speedWarning.style.color = `#${currentColor.getHexString()}`;
+            } else {
+                speedWarning.style.opacity = '0';
+            }
+
+            if(currentTravel < 50) {
+                milestoneText.innerText = "SYSTEM.READY";
+            } else if (gapFactor > 0.1) {
+                milestoneText.innerText = "WARNING: THE VOID";
+            } else {
+                milestoneText.innerText = `DEPTH: ${Math.floor(currentTravel)}M`;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
