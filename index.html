@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Warpspeed 3D Tunnel</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;500;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,500;0,800;0,900;1,900&display=swap" rel="stylesheet">
     <style>
         body, html {
             margin: 0;
@@ -85,6 +85,11 @@
             color: #ff2a40;
             text-shadow: 0 0 20px #ff2a40;
         }
+
+        #noise-overlay {
+            /* Procedural SVG noise for texture overlay */
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+        }
     </style>
     <script type="importmap">
         {
@@ -98,12 +103,13 @@
 
     <div id="canvas-container"></div>
     <div class="vignette"></div>
+    <div id="noise-overlay" class="pointer-events-none absolute inset-0 z-[6] mix-blend-overlay opacity-30 transition-opacity duration-100"></div>
 
     <div id="ui-layer" class="p-8">
         <div class="flex justify-between items-start w-full">
             <div class="flex flex-col">
-                <div class="text-xs tracking-[0.3em] font-light hud-text opacity-70">SYSTEM.ONLINE</div>
-                <div id="speed-warning" class="text-xs tracking-[0.4em] font-bold mt-2">WARPSPEED ENGAGED</div>
+                <div class="text-xs tracking-[0.3em] font-light hud-text opacity-70">BNDR LLC</div>
+                <div id="speed-warning" class="text-xs tracking-[0.4em] font-bold mt-2">HIGH VELOCITY</div>
             </div>
             <div class="flex flex-col items-end">
                 <div id="milestone-text" class="text-sm tracking-[0.2em] font-medium hud-text">DEPTH: 0M</div>
@@ -112,14 +118,14 @@
         </div>
 
         <div id="intro-text" class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-center transition-opacity duration-1000">
-            <h1 class="text-5xl md:text-7xl font-extrabold tracking-tighter mb-4 italic">THE VOID</h1>
-            <p class="text-sm md:text-lg font-light tracking-widest scroll-indicator opacity-80 text-cyan-400">FLICK SCROLL TO ACCELERATE</p>
+            <h1 class="text-5xl md:text-7xl font-black tracking-tighter mb-4 italic">BNDR LLC</h1>
+            <p class="text-sm md:text-lg font-light tracking-widest scroll-indicator opacity-80 text-cyan-400">SCROLL TO EXPLORE</p>
         </div>
 
         <div class="w-full pb-4">
             <div class="flex justify-between text-[10px] tracking-widest mb-2 opacity-50">
-                <span>SECTOR ALPHA</span>
-                <span>SECTOR OMEGA</span>
+                <span>START</span>
+                <span>LIMIT</span>
             </div>
             <div id="progress-container" class="rounded-full overflow-hidden">
                 <div id="progress-bar"></div>
@@ -253,10 +259,14 @@
         tunnel.frustumCulled = false; // Prevent culling due to mathematical curvature
         scene.add(tunnel);
 
-        // 2. Open Sky Background
+        // 2. Open Sky Background (Evolving FBM Fluid Color Fields)
         const skyGeometry = new THREE.SphereGeometry(300, 32, 32);
         const skyMaterial = new THREE.ShaderMaterial({
-            uniforms: { uTime: { value: 0 }, uColor: { value: colorCool } },
+            uniforms: { 
+                uTime: { value: 0 }, 
+                uColor: { value: colorCool },
+                uSpeed: { value: 0 } // Tie warp speed into the fluid turbulence
+            },
             vertexShader: `
                 varying vec2 vUv;
                 void main() {
@@ -267,14 +277,71 @@
             fragmentShader: `
                 uniform float uTime;
                 uniform vec3 uColor;
+                uniform float uSpeed;
                 varying vec2 vUv;
+
+                // 2D Random
+                float random (in vec2 st) {
+                    return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+                }
+
+                // 2D Noise
+                float noise (in vec2 st) {
+                    vec2 i = floor(st);
+                    vec2 f = fract(st);
+                    float a = random(i);
+                    float b = random(i + vec2(1.0, 0.0));
+                    float c = random(i + vec2(0.0, 1.0));
+                    float d = random(i + vec2(1.0, 1.0));
+                    vec2 u = f * f * (3.0 - 2.0 * f);
+                    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+                }
+
+                // Fractional Brownian Motion
+                #define OCTAVES 5
+                float fbm (in vec2 st) {
+                    float value = 0.0;
+                    float amplitude = 0.5;
+                    float shift = 1.2;
+                    mat2 rot = mat2(cos(shift), sin(shift), -sin(shift), cos(shift));
+                    for (int i = 0; i < OCTAVES; i++) {
+                        value += amplitude * noise(st);
+                        st = rot * st * 2.0 + vec2(100.0);
+                        amplitude *= 0.5;
+                    }
+                    return value;
+                }
+
                 void main() {
-                    vec2 p = vUv * 80.0;
-                    float noise = fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
-                    float star = smoothstep(0.98, 1.0, noise) * (sin(uTime * 3.0 + noise * 100.0) * 0.5 + 0.5);
-                    float glow = sin(vUv.y * 10.0 + uTime) * 0.5 + 0.5;
-                    vec3 color = uColor * star * 8.0 + (uColor * 0.05 * glow);
-                    gl_FragColor = vec4(color, 1.0);
+                    vec2 st = vUv * 5.0; // Scale of the fluid
+                    
+                    // Add turbulence based on travel speed
+                    float turbulence = uSpeed * 0.02;
+                    float t = uTime * 0.2;
+
+                    // Domain Warping Step 1
+                    vec2 q = vec2(0.);
+                    q.x = fbm( st + 0.00 * t);
+                    q.y = fbm( st + vec2(1.0));
+
+                    // Domain Warping Step 2
+                    vec2 r = vec2(0.);
+                    r.x = fbm( st + 1.0 * q + vec2(1.7,9.2) + 0.15 * t + turbulence);
+                    r.y = fbm( st + 1.0 * q + vec2(8.3,2.8) + 0.126 * t + turbulence);
+
+                    float f = fbm(st + r);
+
+                    // Map FBM output to colors (Bleeding the temperature shifting uColor)
+                    vec3 deepColor = mix(vec3(0.02, 0.03, 0.08), uColor * 0.3, clamp((f*f)*4.0, 0.0, 1.0));
+                    vec3 midColor = mix(deepColor, uColor, clamp(length(q), 0.0, 1.0));
+                    vec3 finalColor = mix(midColor, vec3(1.0), clamp(length(r.x), 0.0, 1.0) * 0.5);
+
+                    // Add subtle distant stars peeking through the fluid
+                    float starNoise = fract(sin(dot(vUv*150.0, vec2(12.9898, 78.233))) * 43758.5453);
+                    float star = smoothstep(0.99, 1.0, starNoise) * (sin(t * 10.0 + starNoise * 100.0) * 0.5 + 0.5);
+
+                    // Final composition
+                    gl_FragColor = vec4((f*f*f+.6*f*f+.5*f) * finalColor + (star * 1.5), 1.0);
                 }
             `,
             side: THREE.BackSide
@@ -328,8 +395,8 @@
         scene.add(particles);
 
         // --- Content Generation (Dynamic Canvases) ---
-        const texts = ["Awwwards Tier", "Scroll Faster", "Dive Deeper", "The Void", "Unlimited", "WebGL Immersion", "Velocity", "Beyond Reality"];
-        const ctas = ["DISCOVER", "EXPLORE", "ENTER", "UNLOCK", "INITIATE"];
+        const texts = ["Digital Design", "Creative Agency", "BNDR LLC", "Interactive", "WebGL Experiences", "Motion", "Innovation", "Development"];
+        const ctas = ["VIEW WORK", "CONTACT US", "ABOUT BNDR", "SERVICES", "CASE STUDIES"];
 
         function createContentCanvas(type) {
             const canvas = document.createElement('canvas');
@@ -504,6 +571,7 @@
         const milestoneText = document.getElementById('milestone-text');
         const velocityText = document.getElementById('velocity-text');
         const speedWarning = document.getElementById('speed-warning');
+        const noiseOverlay = document.getElementById('noise-overlay');
 
         function animate() {
             requestAnimationFrame(animate);
@@ -560,6 +628,7 @@
             particleMat.uniforms.uColor.value = currentColor;
 
             skyMaterial.uniforms.uColor.value = currentColor;
+            skyMaterial.uniforms.uSpeed.value = smoothedSpeed;
             skyMaterial.uniforms.uTime.value = time;
 
             // 6. The "Void" Break Logic
@@ -602,6 +671,9 @@
             progressBar.style.width = `${progressPercent}%`;
             progressBar.style.background = `#${currentColor.getHexString()}`;
 
+            // Increase noise texture density dynamically based on velocity
+            noiseOverlay.style.opacity = Math.min(0.85, 0.15 + (smoothedSpeed * 0.015));
+
             velocityText.innerText = `VEL: ${(smoothedSpeed * 10).toFixed(1)} KPH`;
 
             if (smoothedSpeed > 15) {
@@ -612,9 +684,7 @@
             }
 
             if(currentTravel < 50) {
-                milestoneText.innerText = "SYSTEM.READY";
-            } else if (gapFactor > 0.1) {
-                milestoneText.innerText = "WARNING: THE VOID";
+                milestoneText.innerText = "READY";
             } else {
                 milestoneText.innerText = `DEPTH: ${Math.floor(currentTravel)}M`;
             }
